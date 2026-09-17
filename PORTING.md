@@ -85,6 +85,48 @@ still ships `piqa.py`, so `DS_KWARGS["piqa"]` now reads the Hub's auto-converted
 branch via `revision="refs/convert/parquet"`. `allenai/winogrande` is already parquet and
 needed no change.
 
+### 9. `src/hyper_llm_modulator/hyper_modulator.py` — rsLoRA scaling ⚠️
+**The bug that broke the reproduction.** See "The scaling bug" below.
+
+## The scaling bug (the one that broke reproduction)
+
+T2L's generated adapters carry `use_rslora: true`, but the weights are calibrated for
+**plain LoRA scaling, alpha/r**. vLLM 0.5.4 -- the version upstream used -- had no rsLoRA
+handling and applied `alpha/r` unconditionally. Modern vLLM (`vllm/lora/peft_helper.py`)
+and modern peft both *honour* the flag and apply `alpha/sqrt(r)`, overdriving every
+generated adapter by sqrt(r) -- **2.83x at r=8** (5.657 instead of 2.0).
+
+A newly added upstream feature broke the reproduction. The config never changed; the
+interpretation of it did.
+
+**Evidence.** GSM8K with the adapter unchanged and only `lora_alpha` varied:
+
+| effective scaling | GSM8K |
+|---|---|
+| 0.707 | 44.05 |
+| 1.414 | 45.11 |
+| 2.828 | **45.79** |
+| 4.243 | 39.42 |
+| 5.657 (rsLoRA -- what we were applying) | 27.82 |
+
+The peak brackets `alpha/r = 2.0`. Paper reports 44.02, base model 41.02.
+
+**Symptom.** At 2.83x the adapter perturbs the base weights enormously -- ‖dW‖/‖W‖ of
+0.32-0.93 (layer 31 q_proj: 0.93), where a normally-trained LoRA sits at 0.01-0.05.
+Generation becomes *terse*, not truncated: the model compresses chain-of-thought
+(36-108 tokens vs the base model's 152-270) and drops the intermediate arithmetic that
+CoT accuracy depends on -- writing "97 eggs" where 16-3-4=9. Multiple-choice tasks
+survive because they only need one token to be right; free-form generation collapses.
+
+**Fix.** `save_lora()` writes `use_rslora=False` on generated adapters, matching how the
+weights were actually calibrated. Existing adapters can be corrected in place by editing
+the flag alone -- the weights are unchanged, only the interpretation.
+
+**Generalise this.** When reproducing older LoRA work on a modern stack, verify the
+*effective scaling factor*, not merely that the adapter loads. A silent 2.83x error
+looks like a mediocre result rather than a bug. Measuring ‖dW‖/‖W‖ against the 1-5%
+norm is a fast sanity check.
+
 ## The silent bug (read this one)
 
 Under transformers 5, `Alibaba-NLP/gte-large-en-v1.5` — the encoder T2L conditions on —
@@ -124,63 +166,51 @@ for name, buf in model.named_buffers():
 
 ## Reproduction status
 
-Base model reproduces essentially exactly, which validates the whole harness — dataset,
-chat template, prompting, sampling, answer extraction and vLLM:
+**Fully reproduced.** All 10 benchmarks match upstream to a mean absolute error of
+**0.18 points** (worst case 0.69), once the rsLoRA scaling is corrected.
+
+Base model without any adapter, confirming the harness independently:
 
 | | GSM8K |
 |---|---|
-| base Mistral-7B-Instruct-v0.2, no adapter | **40.94** |
+| base Mistral-7B-Instruct-v0.2 | **40.94** |
 | upstream README | 41.02 |
 
-With the T2L-generated adapter, results split sharply by required output length
-(`eval_descs` group, `mistral_7b_t2l`):
+T2L-generated adapters, `eval_descs` group, mean of 3 adapters per task. "overdriven" is
+what the same adapters score when `use_rslora=true` is honoured (2.83x too strong):
 
-| task | output required | ours | README T2L | base |
+| task | overdriven | **corrected** | upstream | delta |
 |---|---|---|---|---|
-| OpenBookQA | one letter | 72.33 | 75.07 | 54.20 |
-| WinoGrande | one word | 61.67 | 63.14 | 45.07 |
-| BoolQ | yes/no | 83.38 | 84.62 | 71.56 |
-| HellaSwag | pick of 4 | 61.33 | 67.08 | 49.64 |
-| ARC-e | one letter | 86.77 | 89.20 | 77.74 |
-| ARC-c | one letter | 74.69 | 77.42 | 65.79 |
-| PIQA | pick of 2 | 79.47 | 82.32 | 72.96 |
-| MBPP | a function | **38.35** | 48.71 | 42.61 |
-| GSM8K | multi-step CoT | **26.28** | 44.02 | 41.02 |
-| HumanEval | a function | **18.70** | 38.62 | 39.02 |
+| BoolQ | 83.38 | **84.63** | 84.62 | +0.01 |
+| HellaSwag | 61.33 | **67.09** | 67.08 | +0.01 |
+| ARC-c | 74.69 | **77.39** | 77.42 | −0.03 |
+| ARC-e | 86.77 | **89.16** | 89.20 | −0.04 |
+| WinoGrande | 61.67 | **63.19** | 63.14 | +0.05 |
+| PIQA | 79.47 | **82.21** | 82.32 | −0.11 |
+| OpenBookQA | 72.33 | **74.87** | 75.07 | −0.20 |
+| MBPP | 38.35 | **48.96** | 48.71 | +0.25 |
+| HumanEval | 18.70 | **38.21** | 38.62 | −0.41 |
+| GSM8K | 26.28 | **44.71** | 44.02 | +0.69 |
 
-**Short-output tasks reproduce** (BoolQ within 1.2 points, large gains over base).
-**Long-output tasks fail**, falling below the un-adapted base model.
-
-The failure mode is **premature termination**, not truncation — outputs average ~250
-characters against a 512-token cap. The model produces correct intermediate reasoning
-and stops before the final step:
-
-```
-"She eats three eggs for breakfast / She bakes four muffins
- / She sells the remainder of 9 eggs"          -> predicted 9, answer 18
-```
-
-`extract_answer_number` then picks up the last number seen, an intermediate value.
-
-Across all 10 tasks the boundary is exact: every one of the seven short-output tasks
-gains +6.5 to +18.1 over base and lands 1.2-5.8 under the paper, while all three
-free-form generative tasks fall below the un-adapted base model. No task crosses the
-line. That is one coherent signature rather than a diffuse shortfall.
-
-Evidence that the encoder and hypernetwork are otherwise sound: descriptions borrowed
-from the *wrong* task (`other_train_descs`) degrade results dramatically (GSM8K 14.13,
-HumanEval 4.07), so the task embedding genuinely carries signal and the hypernetwork
-genuinely specialises.
-
-**Open question:** why the adapter biases toward early EOS in free-form generation. The
-base model generates complete answers through the identical harness, so this is
-adapter-induced rather than an eval-plumbing problem.
+A single scaling flag accounted for every discrepancy. Before the fix the failures looked
+like two separate problems — free-form generative tasks collapsing below the un-adapted
+base model, and multiple-choice tasks sitting 1–6 points low. Both were the same 2.83x
+overdrive. Multiple-choice tasks degraded gracefully because they only need one token to
+be right; generation collapsed because sustained output compounds the distortion.
 
 ## Reproducibility caveats
 
 Upstream notes that vLLM's LoRA application is non-deterministic even with a fixed seed,
 and that they re-trained all baselines "due to a small mismatch between the specific
 package version combinations". This port is 20 vLLM releases, one transformers major
-version and two torch major versions ahead of upstream, so small drift on the
-short-output tasks is expected. The long-output failure is far too large to be explained
-that way.
+version and two torch major versions ahead of upstream, so the residual 0.18-point mean
+error is well within that noise.
+
+**A correction, recorded deliberately.** An earlier revision of this document diagnosed
+the generative failure as "premature termination" -- the model stopping before finishing.
+That was wrong. Full generations show complete answers that are merely *terse*; the model
+skips the intermediate arithmetic rather than being cut off. The misdiagnosis came from
+reading truncated log excerpts instead of whole outputs. The `use_rslora` hypothesis was
+also checked early and wrongly dismissed, because modern vLLM *does* handle the flag
+correctly -- which is precisely what breaks compatibility with results produced by a
+version that ignored it.
