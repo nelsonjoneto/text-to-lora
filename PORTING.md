@@ -137,10 +137,14 @@ With the T2L-generated adapter, results split sharply by required output length
 
 | task | output required | ours | README T2L | base |
 |---|---|---|---|---|
+| OpenBookQA | one letter | 72.33 | 75.07 | 54.20 |
+| WinoGrande | one word | 61.67 | 63.14 | 45.07 |
 | BoolQ | yes/no | 83.38 | 84.62 | 71.56 |
+| HellaSwag | pick of 4 | 61.33 | 67.08 | 49.64 |
 | ARC-e | one letter | 86.77 | 89.20 | 77.74 |
 | ARC-c | one letter | 74.69 | 77.42 | 65.79 |
-| HellaSwag | pick of 4 | 61.33 | 67.08 | 49.64 |
+| PIQA | pick of 2 | 79.47 | 82.32 | 72.96 |
+| MBPP | a function | **38.35** | 48.71 | 42.61 |
 | GSM8K | multi-step CoT | **26.28** | 44.02 | 41.02 |
 | HumanEval | a function | **18.70** | 38.62 | 39.02 |
 
@@ -158,9 +162,10 @@ and stops before the final step:
 
 `extract_answer_number` then picks up the last number seen, an intermediate value.
 
-The degradation scales monotonically with required output length (BoolQ −1.2, ARC-e
-−2.4, ARC-c −2.7, HellaSwag −5.8, GSM8K −17.7, HumanEval −19.9), which is one coherent
-signature rather than a diffuse shortfall.
+Across all 10 tasks the boundary is exact: every one of the seven short-output tasks
+gains +6.5 to +18.1 over base and lands 1.2-5.8 under the paper, while all three
+free-form generative tasks fall below the un-adapted base model. No task crosses the
+line. That is one coherent signature rather than a diffuse shortfall.
 
 Evidence that the encoder and hypernetwork are otherwise sound: descriptions borrowed
 from the *wrong* task (`other_train_descs`) degrade results dramatically (GSM8K 14.13,
