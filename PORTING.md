@@ -78,6 +78,13 @@ not, causing an interactive `y/N` prompt that hangs unattended runs.
 Switched to the repo's own `DS_PATHS`/`DS_KWARGS` tables, which already mapped it
 correctly to `openai/gsm8k`.
 
+### 8. `src/hyper_llm_modulator/vllm_eval.py` — script-based datasets
+`datasets` 4+ removed support for loading datasets via Python scripts
+(`RuntimeError: Dataset scripts are no longer supported, but found piqa.py`). `ybisk/piqa`
+still ships `piqa.py`, so `DS_KWARGS["piqa"]` now reads the Hub's auto-converted parquet
+branch via `revision="refs/convert/parquet"`. `allenai/winogrande` is already parquet and
+needed no change.
+
 ## The silent bug (read this one)
 
 Under transformers 5, `Alibaba-NLP/gte-large-en-v1.5` — the encoder T2L conditions on —

@@ -344,7 +344,9 @@ DS_KWARGS = {
     "gsm8k": dict(name="main", split="test"),
     "boolq": dict(split="validation"),
     "winogrande": dict(name="winogrande_debiased", split="validation"),
-    "piqa": dict(split="validation"),
+    # datasets>=4 dropped script-based loaders; piqa ships piqa.py, so read the
+    # Hub's auto-converted parquet branch instead
+    "piqa": dict(split="validation", revision="refs/convert/parquet"),
     "hellaswag": dict(split="validation"),
     "arc_easy": dict(name="ARC-Easy", split="test"),
     "arc_challenge": dict(name="ARC-Challenge", split="test"),
