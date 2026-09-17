@@ -20,3 +20,6 @@ watcher_state.yaml
 trained_t2l/
 downloaded_lora/
 *.zip
+# port artifacts
+*.orig
+trained_t2l/

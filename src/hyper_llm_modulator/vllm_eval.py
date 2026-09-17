@@ -193,7 +193,9 @@ def eval_gsm8k(
 ):
     system_message = ""
     template = "Please answer the following question: {question}\n\n"
-    dataset = datasets.load_dataset("gsm8k", "main", split="test")
+    # the Hub now requires namespace/name; use the repo's own DS_PATHS/DS_KWARGS
+    # tables, which already map this correctly, instead of the bare name
+    dataset = datasets.load_dataset(DS_PATHS["gsm8k"], **DS_KWARGS["gsm8k"])
     samples = []
     for sample in dataset:
         problem = template.format(**sample)

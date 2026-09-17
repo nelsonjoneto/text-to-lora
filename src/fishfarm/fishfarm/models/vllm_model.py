@@ -13,6 +13,7 @@ from .tokenization_utils import tokenize_messages
 
 with try_import() as _imports:
     import vllm
+    from vllm import TokensPrompt
 
 _imports.check()
 
@@ -74,7 +75,7 @@ class VLLMModel(Model):
         sampling_params.max_tokens = 1  # We need zero new tokens, but 1 is the vLLM's minimum.
 
         completions = self.llm.generate(
-            prompt_token_ids=token_ids_list,
+            [TokensPrompt(prompt_token_ids=ids) for ids in token_ids_list],
             sampling_params=sampling_params,
         )
 

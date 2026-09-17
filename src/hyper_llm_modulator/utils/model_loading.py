@@ -91,7 +91,16 @@ def get_model(
     if model_kwargs is not None:
         model_init_kwargs.update(model_kwargs)
     if use_flash_attn:
-        model_init_kwargs["attn_implementation"] = "flash_attention_2"
+        try:
+            import flash_attn  # noqa: F401
+
+            model_init_kwargs["attn_implementation"] = "flash_attention_2"
+        except ImportError:
+            # No flash-attn wheel exists for torch 2.11/cu130 on sm_120 (Blackwell).
+            # SDPA dispatches to fused kernels there and is equivalent for our use:
+            # this model is only used for LoRA generation/training, while vLLM uses
+            # its own attention backend during evaluation.
+            model_init_kwargs["attn_implementation"] = "sdpa"
     if train:
         # for training disable cache
         model_init_kwargs["use_cache"] = False
@@ -127,6 +136,75 @@ def get_peft_config(model_dir, peft_type, **kwargs):
     return peft_config
 
 
+def _fix_uninitialized_buffers(model):
+    """transformers 5 materializes models from the meta device and only fills buffers
+    that appear in the checkpoint. gte builds `position_ids`, `inv_freq` and the RoPE
+    `cos_cached`/`sin_cached` in __init__ as NON-PERSISTENT buffers, so under
+    transformers 5 they come back as uninitialized memory (position_ids, inv_freq) or
+    as zeros (the cos/sin caches). Zeroed RoPE caches strip out all positional
+    information, which collapses every input to nearly the same embedding.
+    Rebuild them with the modules' own initialisation logic."""
+    emb = getattr(model, "embeddings", None)
+    if emb is None:
+        return model
+
+    pos = getattr(emb, "position_ids", None)
+    if pos is not None:
+        expected = torch.arange(pos.numel(), device=pos.device, dtype=pos.dtype)
+        if not torch.equal(pos, expected):
+            logger.warning("rebuilding uninitialized gte position_ids buffer")
+            emb.register_buffer("position_ids", expected, persistent=False)
+
+    rot = getattr(emb, "rotary_emb", None)
+    if rot is not None and getattr(rot, "inv_freq", None) is not None:
+        cos = getattr(rot, "cos_cached", None)
+        broken = (
+            not torch.isfinite(rot.inv_freq).all()
+            or float(rot.inv_freq.abs().max()) > 1e6
+            or (cos is not None and float(cos.abs().max()) == 0.0)
+        )
+        if broken:
+            logger.warning("rebuilding uninitialized gte RoPE buffers (inv_freq, cos/sin caches)")
+            dev = rot.inv_freq.device
+            # mirrors RotaryEmbedding.__init__
+            rot.register_buffer(
+                "inv_freq",
+                1.0 / (rot.base ** (torch.arange(0, rot.dim, 2).float().to(dev) / rot.dim)),
+                persistent=False,
+            )
+            seq_len = rot.max_position_embeddings
+            if getattr(rot, "scaling_factor", None):
+                # NTKScalingRotaryEmbedding.__init__ re-caches at max_pos * scaling_factor
+                seq_len = int(seq_len * rot.scaling_factor)
+            rot._set_cos_sin_cache(seq_len, dev, torch.get_default_dtype())
+    return model
+
+
+def _restore_get_extended_attention_mask(model):
+    """transformers 5.x removed ModuleUtilsMixin.get_extended_attention_mask, but
+    gte-large-en-v1.5's `trust_remote_code` modeling.py still calls it. Reattach the
+    4.x implementation (non-decoder branch) so the remote code keeps working."""
+    import types
+
+    if hasattr(model, "get_extended_attention_mask"):
+        return model
+
+    def get_extended_attention_mask(self, attention_mask, input_shape=None, device=None, dtype=None):
+        if dtype is None:
+            dtype = self.dtype
+        if attention_mask.dim() == 3:
+            extended = attention_mask[:, None, :, :]
+        elif attention_mask.dim() == 2:
+            extended = attention_mask[:, None, None, :]
+        else:
+            raise ValueError(f"Wrong shape for attention_mask (shape {attention_mask.shape})")
+        extended = extended.to(dtype=dtype)
+        return (1.0 - extended) * torch.finfo(dtype).min
+
+    model.get_extended_attention_mask = types.MethodType(get_extended_attention_mask, model)
+    return model
+
+
 def get_emb_model_and_fns(emb_model_name, device):
     emb_model = AutoModel.from_pretrained(
         emb_model_name,
@@ -134,7 +212,11 @@ def get_emb_model_and_fns(emb_model_name, device):
         torch_dtype=torch.float32 if "gte" in emb_model_name else torch.bfloat16,
         trust_remote_code=True,
     ).eval()
-    emb_tokenizer = AutoTokenizer.from_pretrained(emb_model_name)
+    _restore_get_extended_attention_mask(emb_model)
+    _fix_uninitialized_buffers(emb_model)
+    # the model load above already passes trust_remote_code; without it here the
+    # tokenizer blocks on an interactive y/N prompt and hangs unattended runs
+    emb_tokenizer = AutoTokenizer.from_pretrained(emb_model_name, trust_remote_code=True)
     if emb_tokenizer.pad_token_id is None:
         emb_tokenizer.pad_token_id = emb_tokenizer.eos_token_id
     task_desc_format_fn = add_full_stop
