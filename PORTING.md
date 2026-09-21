@@ -99,6 +99,39 @@ nothing in the training or evaluation path touches it.
 Note the UI generates adapters through `gen_and_save_lora` -> `save_lora`, so it picks up
 the rsLoRA fix in change 9 automatically and does not emit overdriven adapters.
 
+## Running fully offline
+
+`scripts/prefetch_offline.py` caches everything the repo touches; after that,
+`export HF_HUB_OFFLINE=1` makes the whole stack run with no network. Verified end to
+end: all 10 benchmarks and all 510 Lots-of-LoRAs task datasets load from cache.
+
+```bash
+python scripts/prefetch_offline.py --bases all   # ~120GB, models dominate
+export HF_HUB_OFFLINE=1
+python scripts/prefetch_offline.py --verify      # exits 0 when genuinely offline-ready
+```
+
+| component | size |
+|---|---|
+| 3 base models (Mistral-7B, Llama-3.1-8B, Gemma-2-2B) + gte encoder | ~118 GB |
+| 510 Lots-of-LoRAs task datasets | 2.8 GB |
+| 10 benchmark datasets (eval + train splits) | ~100 MB |
+| evalplus HumanEval+/MBPP+ | 1.0 GB |
+| 4 T2L checkpoints | ~1.9 GB |
+
+Two things that make this non-trivial, both learned the hard way:
+
+- **Datasets must be fetched through `load_dataset` with the exact kwargs the repo uses**
+  (read from `tasks/*/metadata.yaml`). The datasets cache is keyed by
+  `(path, name, split)`, so a bare repo download still leaves `load_dataset` reaching for
+  the network at run time.
+- **`mbpp` has configs `['full','sanitized']` and no default**, so an unnamed config is
+  ambiguous offline and raises `ValueError` even when cached. Both are pinned explicitly.
+  (The repo actually reads MBPP through evalplus, not HF, but caching both costs nothing.)
+
+Keep `--workers` low: 8 parallel dataset pulls tripped Hub rate limiting at ~330/510.
+3 workers with retries completes all 510 cleanly.
+
 ## The scaling bug (the one that broke reproduction)
 
 T2L's generated adapters carry `use_rslora: true`, but the weights are calibrated for

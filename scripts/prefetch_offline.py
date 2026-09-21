@@ -39,7 +39,11 @@ BENCHMARKS = [
     ("allenai/ai2_arc",         dict(name="ARC-Challenge", split="test")),
     ("allenai/openbookqa",      dict(split="test")),
     ("openai/openai_humaneval", dict(split="test")),
-    ("google-research-datasets/mbpp", dict(split="test")),
+    # mbpp has configs ['full','sanitized'] and NO default, so an unnamed config is
+    # ambiguous offline. The repo actually reads MBPP via evalplus, not HF, but cache
+    # both configs explicitly so nothing can surprise us later.
+    ("google-research-datasets/mbpp", dict(name="full", split="test")),
+    ("google-research-datasets/mbpp", dict(name="sanitized", split="test")),
 ]
 # Also pulled by the training-time splits (train[:500]) the quick-eval path uses.
 BENCHMARK_TRAIN_SPLITS = [
@@ -68,18 +72,30 @@ def lol_datasets():
     return sorted(out)
 
 
-def fetch_dataset(path, name=None, split=None, revision=None):
-    import datasets
+def fetch_dataset(path, name=None, split=None, revision=None, retries=1):
+    """Fetch one dataset. The Hub rate-limits bulk pulls, so retry with backoff."""
+    import datasets, random, time
     kw = {k: v for k, v in dict(name=name, split=split, revision=revision).items() if v}
-    datasets.load_dataset(path, **kw)
-    return f"{path} {kw.get('name','')} {kw.get('split','')}".strip()
+    last = None
+    for attempt in range(retries):
+        try:
+            datasets.load_dataset(path, **kw)
+            return f"{path} {kw.get('name','')} {kw.get('split','')}".strip()
+        except Exception as e:
+            last = e
+            if attempt < retries - 1:
+                # exponential backoff with jitter; 429s need real time, not a quick retry
+                time.sleep(min(60, 2 ** attempt * 5) + random.uniform(0, 3))
+    raise last
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bases", nargs="+", default=["mistral"],
                     choices=list(BASES) + ["all"], help="which base models to fetch")
-    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--workers", type=int, default=3,
+                    help="keep low: 8 tripped Hub rate limiting at ~330/510")
+    ap.add_argument("--retries", type=int, default=4)
     ap.add_argument("--skip-models", action="store_true")
     ap.add_argument("--skip-datasets", action="store_true",
                     help="models and checkpoints only (for topping up a gated base later)")
@@ -158,19 +174,25 @@ def main():
 
     lol = lol_datasets()
     print(f"=== Lots-of-LoRAs task datasets ({len(lol)}, ~0.7GB total) ===")
-    done = failed = 0
+    done = 0
+    errors = {}
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(fetch_dataset, p, n, s): p for p, n, s in lol}
+        futs = {ex.submit(fetch_dataset, p, n, s, retries=args.retries): p for p, n, s in lol}
         for f in as_completed(futs):
             try:
                 f.result(); done += 1
-            except Exception:
-                failed += 1
-            if (done + failed) % 50 == 0:
-                print(f"   {done+failed}/{len(lol)}  ok={done} failed={failed}", flush=True)
+            except Exception as e:
+                errors.setdefault(type(e).__name__, []).append((futs[f], str(e)[:120]))
+            n_done = done + sum(len(v) for v in errors.values())
+            if n_done % 50 == 0:
+                print(f"   {n_done}/{len(lol)}  ok={done} failed={n_done-done}", flush=True)
+    failed = sum(len(v) for v in errors.values())
     print(f"   done: {done} cached, {failed} failed")
+    for kind, items in sorted(errors.items(), key=lambda kv: -len(kv[1])):
+        print(f"   {len(items):4d}x {kind}")
+        print(f"        e.g. {items[0][0]}: {items[0][1]}")
     if failed:
-        print("   re-run to retry failures (the Hub rate-limits bulk dataset pulls)")
+        print("   re-run to retry - already-cached datasets are skipped quickly")
 
     print()
     print("Now switch to offline with:")
