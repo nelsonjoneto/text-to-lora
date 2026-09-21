@@ -88,6 +88,17 @@ needed no change.
 ### 9. `src/hyper_llm_modulator/hyper_modulator.py` — rsLoRA scaling ⚠️
 **The bug that broke the reproduction.** See "The scaling bug" below.
 
+### 10. `pyproject.toml` — Gradio major version
+The web UI declares `gradio>=5.29.0`, which now resolves to Gradio 6. Gradio 6 removed
+`Chatbot(type=...)` and moved `theme` from the `Blocks` constructor to `launch()`, so
+`webui/app.py` fails immediately with
+`TypeError: Chatbot.__init__() got an unexpected keyword argument 'type'`.
+Pinned to `>=5.29.0,<6`: gradio is used only by `webui/` (53 `gr.*` call sites) and
+nothing in the training or evaluation path touches it.
+
+Note the UI generates adapters through `gen_and_save_lora` -> `save_lora`, so it picks up
+the rsLoRA fix in change 9 automatically and does not emit overdriven adapters.
+
 ## The scaling bug (the one that broke reproduction)
 
 T2L's generated adapters carry `use_rslora: true`, but the weights are calibrated for

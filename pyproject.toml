@@ -25,7 +25,9 @@ dependencies = [
     "fasttext-wheel",
     "rouge-score",
     "evalplus",
-    "gradio>=5.29.0",
+    # Gradio 6 removed Chatbot(type=...) and moved `theme` off the Blocks
+    # constructor; webui/app.py has 53 gr.* call sites written against 5.x.
+    "gradio>=5.29.0,<6",
     "vllm==0.25.1",
 ]
 
